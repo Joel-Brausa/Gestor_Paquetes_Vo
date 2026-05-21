@@ -538,10 +538,10 @@ else:
     col1, col2, col3, col4 = st.columns(4)
     col5, col6, col7, col8 = st.columns(4)
 
-    paquete_num = int(database.get_next_paquete_num(database.get_project_id(st.session_state.selected_project)))
+    next_paquete_num = int(database.get_next_paquete_num(database.get_project_id(st.session_state.selected_project)))
 
     with col1:
-        st.metric("Paquete Num", paquete_num)
+        paquete_num = st.number_input("Paquete Num", min_value=1, value=next_paquete_num, key="new_paquete_num")
     with col2:
         paquete_num_of = st.number_input("Paquete OF", min_value=0, value=1, key="new_paquete_num_of")
     with col3:
