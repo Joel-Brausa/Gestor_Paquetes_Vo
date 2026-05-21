@@ -22,15 +22,15 @@ def _load_excel_bytes(project_name: str) -> Optional[bytes]:
 
 def _extract_marca_for_h(marca_raw) -> str:
     """
-    Derive the value to write in column H from the marca DB field.
-    Returns the text before the last '-' in the string.
-    Example: "S355-J0" → "S355",  "Fe510-B" → "Fe510",  "S355J2" → "S355J2"
+    Extract the search key from the DB marca field.
+    Returns the text AFTER the last '-' in the string (used to search column AM).
+    Example: "P62989-07031" → "07031",  "S355-J0" → "J0",  "S355J2" → "S355J2"
     """
     if not marca_raw:
         return ""
     s = str(marca_raw).strip()
     if "-" in s:
-        return s.rsplit("-", 1)[0].strip()
+        return s.rsplit("-", 1)[1].strip()
     return s
 
 
@@ -119,49 +119,47 @@ def find_marca_in_column_am(project_name: str, marca: str) -> str:
         raise ValueError(f"Error al buscar marca en AM: {str(e)}")
 
 
-def _build_am_cache(ws) -> list[str]:
+def _build_am_cache(excel_bytes: bytes) -> list[str]:
     """
-    Read all non-empty plain values from column AM (col 39).
-    Returns a list of stripped strings for marca lookup.
+    Read all non-empty values from column AM (col 39) using data_only=True
+    so formula-cached values are returned (same behaviour as find_marca_in_column_am).
+    Returns a list of stripped strings.
     """
     col_am = 39
+    wb = load_workbook(BytesIO(excel_bytes), data_only=True)
+    ws = wb.active
     values = []
     for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=col_am, max_col=col_am):
         v = row[0].value
         if v is not None:
             values.append(str(v).strip())
+    wb.close()
     return values
 
 
 def _lookup_marca_in_am(marca_raw: str, am_values: list[str]) -> str:
     """
-    Find the best matching value in the AM column for a given DB marca.
+    Find the matching value in the AM column for a given DB marca.
+
+    The DB marca field (e.g. "07031") is used as search key.
+    An AM value matches if it ends with that key (e.g. "00010 / P62989-07031").
 
     Search strategy (in order):
-      1. Exact match against full marca string.
-      2. Any AM value that contains the full marca string as substring.
-      3. Exact match against the part before the last '-' (short form).
-      4. Any AM value that contains the short form as substring.
-      5. Fallback: return the short form extracted from the DB field.
+      1. AM value ends with the marca key (e.g. endswith "07031").
+      2. AM value contains the marca key as substring (looser fallback).
+      3. Fallback: return the marca key itself.
     """
     if not marca_raw:
         return ""
-    full = str(marca_raw).strip()
-    short = _extract_marca_for_h(full)  # text before last '-'
+    key = str(marca_raw).strip()
 
     for v in am_values:
-        if v == full:
+        if v.endswith(key):
             return v
     for v in am_values:
-        if full in v:
+        if key in v:
             return v
-    for v in am_values:
-        if v == short:
-            return v
-    for v in am_values:
-        if short and short in v:
-            return v
-    return short  # fallback: at least return the extracted short form
+    return key  # fallback: write the raw marca if nothing found in AM
 
 
 def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
@@ -189,12 +187,12 @@ def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
     if not excel_bytes:
         raise ValueError("Sube un Excel base primero")
 
+    # Build AM lookup cache using data_only=True (gets formula-cached values)
+    am_values = _build_am_cache(excel_bytes)
+
+    # Load for writing (preserves formulas in G etc.)
     wb = load_workbook(BytesIO(excel_bytes))
     ws = wb.active
-
-    # Build AM lookup cache once from the current workbook
-    am_values = _build_am_cache(ws)
-
     existing_lines = _get_existing_lines(ws)
 
     added = 0
