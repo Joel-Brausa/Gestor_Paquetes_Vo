@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "voest-paquets",
+      "runtimeExecutable": "powershell",
+      "runtimeArgs": ["-Command", ". .\\load-env.ps1; python app.py"],
+      "port": 7860
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(python -c ' *)",
+      "Bash(ping -n 1 db.taegefqeemjdzxreyosf.supabase.co)"
+    ]
+  }
+}

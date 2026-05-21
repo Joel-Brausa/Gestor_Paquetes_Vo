@@ -1,0 +1,21 @@
+
+  You can now view your Streamlit app in your browser.
+
+  Local URL: http://localhost:7861
+  Network URL: http://192.168.100.181:7861
+
+2026-05-18 09:41:30.691 Serialization of dataframe to Arrow table was unsuccessful due to: ("Expected bytes, got a 'int' object", 'Conversion failed for column Col9 with type object'). Applying automatic fixes for column types to make the dataframe Arrow-compatible.
+2026-05-18 09:41:42.018 Serialization of dataframe to Arrow table was unsuccessful due to: ("Expected bytes, got a 'int' object", 'Conversion failed for column Col9 with type object'). Applying automatic fixes for column types to make the dataframe Arrow-compatible.
+Task exception was never retrieved
+future: <Task finished name='Task-203' coro=<WebSocketProtocol13.write_message.<locals>.wrapper() done, defined at C:\Users\jlopez\AppData\Local\Programs\Python\Python313\Lib\site-packages\tornado\websocket.py:1086> exception=WebSocketClosedError()>
+Traceback (most recent call last):
+  File "C:\Users\jlopez\AppData\Local\Programs\Python\Python313\Lib\site-packages\tornado\websocket.py", line 1088, in wrapper
+    await fut
+tornado.iostream.StreamClosedError: Stream is closed
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\jlopez\AppData\Local\Programs\Python\Python313\Lib\site-packages\tornado\websocket.py", line 1090, in wrapper
+    raise WebSocketClosedError()
+tornado.websocket.WebSocketClosedError
