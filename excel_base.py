@@ -119,6 +119,51 @@ def find_marca_in_column_am(project_name: str, marca: str) -> str:
         raise ValueError(f"Error al buscar marca en AM: {str(e)}")
 
 
+def _build_am_cache(ws) -> list[str]:
+    """
+    Read all non-empty plain values from column AM (col 39).
+    Returns a list of stripped strings for marca lookup.
+    """
+    col_am = 39
+    values = []
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=col_am, max_col=col_am):
+        v = row[0].value
+        if v is not None:
+            values.append(str(v).strip())
+    return values
+
+
+def _lookup_marca_in_am(marca_raw: str, am_values: list[str]) -> str:
+    """
+    Find the best matching value in the AM column for a given DB marca.
+
+    Search strategy (in order):
+      1. Exact match against full marca string.
+      2. Any AM value that contains the full marca string as substring.
+      3. Exact match against the part before the last '-' (short form).
+      4. Any AM value that contains the short form as substring.
+      5. Fallback: return the short form extracted from the DB field.
+    """
+    if not marca_raw:
+        return ""
+    full = str(marca_raw).strip()
+    short = _extract_marca_for_h(full)  # text before last '-'
+
+    for v in am_values:
+        if v == full:
+            return v
+    for v in am_values:
+        if full in v:
+            return v
+    for v in am_values:
+        if v == short:
+            return v
+    for v in am_values:
+        if short and short in v:
+            return v
+    return short  # fallback: at least return the extracted short form
+
+
 def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
     """
     Write project lines to Excel starting at row 14. Each DB line → one Excel row.
@@ -127,13 +172,13 @@ def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
     Columns written per row:
       A  — paquete_code  (project/NNNN)
       B  — "Bundle"
-      H  — marca extracted from DB field: text before the last '-'
+      H  — value found in column AM that matches the DB marca field
       I  — piezas
 
     Col G formula preserved (never touched). Cols C–F left untouched.
 
     Duplicate key: (paquete_code, marca_h, piezas_str) — stable across syncs
-    because marca is derived directly from the DB field (no formula lookup).
+    because marca_h is read back from col H (plain value written by us).
 
     Saves updated Excel back to database. Returns dict: {added, duplicates, errors}
     """
@@ -146,6 +191,10 @@ def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
 
     wb = load_workbook(BytesIO(excel_bytes))
     ws = wb.active
+
+    # Build AM lookup cache once from the current workbook
+    am_values = _build_am_cache(ws)
+
     existing_lines = _get_existing_lines(ws)
 
     added = 0
@@ -170,8 +219,8 @@ def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
             )
             paquete_code = f"{project_name}/{paquete_num_str}"
 
-            # H: text before the last '-' in the marca field
-            marca_h = _extract_marca_for_h(line.get("marca", ""))
+            # H: value from column AM that best matches the DB marca
+            marca_h = _lookup_marca_in_am(line.get("marca", ""), am_values)
             piezas   = line.get("piezas", "")
             piezas_str = str(piezas) if piezas else ""
 
@@ -182,7 +231,7 @@ def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
 
             # Col A: paquete code  |  Col B: tipo fijo
             # Col G (7): fórmula ya en el template — no se toca
-            # Col H (8): marca (texto antes del último '-')
+            # Col H (8): valor encontrado en columna AM
             # Col I (9): piezas
             ws.cell(row=current_row, column=1).value = paquete_code
             ws.cell(row=current_row, column=2).value = "Bundle"
