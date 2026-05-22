@@ -131,6 +131,9 @@ if "logistica_excel_bytes" not in st.session_state:
 if "logistica_excel_filename" not in st.session_state:
     st.session_state.logistica_excel_filename = None
 
+if "logistica_cache_project" not in st.session_state:
+    st.session_state.logistica_cache_project = None
+
 if "pdf_upload_key" not in st.session_state:
     st.session_state.pdf_upload_key = 0
 
@@ -496,33 +499,32 @@ col1, col2 = st.columns(2)
 
 with col1:
     if st.button("🔄 Refrescar tabla", key="refresh_lines_btn"):
+        st.session_state.logistica_cache_project = None  # forzar regeneración
         st.rerun()
 
-with col2:
-    if st.button("🚚 Exportar Logística", key="export_btn"):
-        if not st.session_state.selected_project:
-            st.error("Selecciona un proyecto primero.")
-        elif not lines:
-            st.error("El proyecto no tiene líneas para exportar.")
-        else:
-            try:
-                excel_bytes = exporter.build_excel(lines)
-                st.session_state.logistica_excel_bytes = excel_bytes
-                st.session_state.logistica_excel_filename = (
-                    f"{st.session_state.selected_project}-Logística.xlsx"
-                )
-                st.rerun()
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
+# Generar Excel de logística una sola vez por proyecto (cache en session_state)
+if lines and st.session_state.selected_project:
+    if st.session_state.logistica_cache_project != st.session_state.selected_project:
+        try:
+            st.session_state.logistica_excel_bytes = exporter.build_excel(lines)
+            st.session_state.logistica_excel_filename = (
+                f"{st.session_state.selected_project}-Logística.xlsx"
+            )
+            st.session_state.logistica_cache_project = st.session_state.selected_project
+        except Exception as e:
+            st.error(f"Error generando Logística: {str(e)}")
 
-if st.session_state.logistica_excel_bytes:
-    st.download_button(
-        label="⬇️ Descargar Excel Logística",
-        data=st.session_state.logistica_excel_bytes,
-        file_name=st.session_state.logistica_excel_filename or "Logistica.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="logistica_download_btn",
-    )
+with col2:
+    if st.session_state.logistica_excel_bytes and lines:
+        st.download_button(
+            label="⬇️ Exportar Logística",
+            data=st.session_state.logistica_excel_bytes,
+            file_name=st.session_state.logistica_excel_filename or "Logistica.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="logistica_download_btn",
+        )
+    elif not lines:
+        st.button("🚚 Exportar Logística", key="export_btn_disabled", disabled=True)
 
 lines_df = _lines_table(st.session_state.selected_project)
 if not lines_df.empty:
