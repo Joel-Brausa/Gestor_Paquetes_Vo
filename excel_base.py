@@ -168,7 +168,7 @@ def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
     Multiple lines per paquete are supported (different marca / piezas).
 
     Columns written per row:
-      A  — paquete_code  (project/NNNN)
+      A  — paquete_code  (B5/NNNN — prefix read from cell B5, fallback to project_name)
       B  — "Bundle"
       H  — value found in column AM that matches the DB marca field
       I  — piezas
@@ -193,6 +193,11 @@ def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
     # Load for writing (preserves formulas in G etc.)
     wb = load_workbook(BytesIO(excel_bytes))
     ws = wb.active
+
+    # Read the prefix for column A from cell B5 (fallback to project_name if empty)
+    b5_value = ws.cell(row=5, column=2).value
+    col_a_prefix = str(b5_value).strip() if b5_value else project_name
+
     existing_lines = _get_existing_lines(ws)
 
     added = 0
@@ -215,7 +220,7 @@ def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
                 f"{paquete_num:04d}" if isinstance(paquete_num, int)
                 else str(paquete_num).zfill(4)
             )
-            paquete_code = f"{project_name}/{paquete_num_str}"
+            paquete_code = f"{col_a_prefix}/{paquete_num_str}"
 
             # H: value from column AM that best matches the DB marca
             marca_h = _lookup_marca_in_am(line.get("marca", ""), am_values)
