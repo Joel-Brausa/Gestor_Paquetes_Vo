@@ -351,14 +351,24 @@ def insert_line(
     piezas: int | None,
     longitud: float | None,
     marca: str | None,
+    of_number: str | None = None,
+    n_pedido: str | None = None,
+    articulo: str | None = None,
 ) -> int:
-    dummy_of = "_MANUAL_ENTRIES"
+    """
+    Insert a line into an existing or new packing_list for the project.
+    If of_number is provided and a packing_list with that OF already exists for
+    this project, the line is appended to it.  If it does not exist, a new
+    packing_list is created with the supplied of_number / n_pedido / articulo.
+    When of_number is empty or None, a shared '_MANUAL_ENTRIES' packing_list is used.
+    """
+    of_key = (of_number.strip() if of_number and of_number.strip() else None) or "_MANUAL_ENTRIES"
     conn = _connect()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id FROM packing_lists WHERE project_id = %s AND of_number = %s",
-                (project_id, dummy_of),
+                (project_id, of_key),
             )
             pl_row = cur.fetchone()
 
@@ -370,7 +380,10 @@ def insert_line(
                         nota, total_piezas, kilos_teoricos, imported_at)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                        RETURNING id""",
-                    (project_id, dummy_of, None, None, None, None, None, None, now),
+                    (project_id, of_key,
+                     n_pedido.strip() if n_pedido and n_pedido.strip() else None,
+                     articulo.strip() if articulo and articulo.strip() else None,
+                     None, None, None, None, now),
                 )
                 pl_id = cur.fetchone()[0]
             else:
@@ -388,6 +401,159 @@ def insert_line(
             line_id = cur.fetchone()[0]
         conn.commit()
         return line_id
+    finally:
+        conn.close()
+
+
+def get_project_lines_with_ids(project_id: int) -> list[dict]:
+    """Like get_project_lines but also returns the primary key of each line as 'line_id'."""
+    conn = _connect()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT
+                       l.id            AS line_id,
+                       p.name          AS proyecto,
+                       pl.of_number, pl.n_pedido, pl.articulo,
+                       pl.ref_pedido, pl.nota,
+                       pl.total_piezas, pl.kilos_teoricos,
+                       l.paquete_num, l.paquete_num_of, l.kilos_paquete,
+                       l.linea, l.piezas, l.longitud, l.marca
+                   FROM lines l
+                   JOIN packing_lists pl ON pl.id = l.packing_list_id
+                   JOIN projects p       ON p.id  = pl.project_id
+                   WHERE pl.project_id = %s
+                   ORDER BY pl.of_number, l.paquete_num, l.linea""",
+                (project_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def delete_line_by_id(line_id: int) -> bool:
+    """Delete a single line by its primary key. Returns True if a row was deleted."""
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM lines WHERE id = %s RETURNING id", (line_id,))
+            deleted = cur.fetchone() is not None
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
+
+
+def update_line(
+    line_id: int,
+    paquete_num: int,
+    paquete_num_of: int | None,
+    kilos_paquete: float | None,
+    linea: int | None,
+    piezas: int | None,
+    longitud: float | None,
+    marca: str | None,
+) -> bool:
+    """Update the fields of a single line. Returns True if a row was updated."""
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE lines SET
+                       paquete_num    = %s,
+                       paquete_num_of = %s,
+                       kilos_paquete  = %s,
+                       linea          = %s,
+                       piezas         = %s,
+                       longitud       = %s,
+                       marca          = %s
+                   WHERE id = %s
+                   RETURNING id""",
+                (paquete_num, paquete_num_of, kilos_paquete,
+                 linea, piezas, longitud, marca, line_id),
+            )
+            updated = cur.fetchone() is not None
+        conn.commit()
+        return updated
+    finally:
+        conn.close()
+
+
+def update_line_full(
+    project_id: int,
+    line_id: int,
+    of_number: str | None,
+    n_pedido: str | None,
+    articulo: str | None,
+    paquete_num: int,
+    paquete_num_of: int | None,
+    kilos_paquete: float | None,
+    linea: int | None,
+    piezas: int | None,
+    longitud: float | None,
+    marca: str | None,
+) -> bool:
+    """
+    Update all fields of a line, including packing-list level fields
+    (of_number, n_pedido, articulo).
+
+    - Finds or creates a packing_list matching (project_id, of_key).
+    - Updates that packing_list's n_pedido and articulo with the supplied values.
+    - Reassigns the line to that packing_list and updates all line fields.
+    - Returns True if the line row was found and updated.
+    """
+    of_key = (of_number.strip() if of_number and of_number.strip() else None) or "_MANUAL_ENTRIES"
+    np_val = n_pedido.strip() if n_pedido and n_pedido.strip() else None
+    art_val = articulo.strip() if articulo and articulo.strip() else None
+
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            # Find or create the target packing_list
+            cur.execute(
+                "SELECT id FROM packing_lists WHERE project_id = %s AND of_number = %s",
+                (project_id, of_key),
+            )
+            pl_row = cur.fetchone()
+
+            if not pl_row:
+                now = datetime.now(timezone.utc).isoformat()
+                cur.execute(
+                    """INSERT INTO packing_lists
+                           (project_id, of_number, n_pedido, articulo, ref_pedido,
+                            nota, total_piezas, kilos_teoricos, imported_at)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           RETURNING id""",
+                    (project_id, of_key, np_val, art_val, None, None, None, None, now),
+                )
+                target_pl_id = cur.fetchone()[0]
+            else:
+                target_pl_id = pl_row[0]
+                # Update packing-list metadata with whatever the user provided
+                cur.execute(
+                    "UPDATE packing_lists SET n_pedido = %s, articulo = %s WHERE id = %s",
+                    (np_val, art_val, target_pl_id),
+                )
+
+            # Reassign and update the line
+            cur.execute(
+                """UPDATE lines SET
+                       packing_list_id = %s,
+                       paquete_num     = %s,
+                       paquete_num_of  = %s,
+                       kilos_paquete   = %s,
+                       linea           = %s,
+                       piezas          = %s,
+                       longitud        = %s,
+                       marca           = %s
+                   WHERE id = %s
+                   RETURNING id""",
+                (target_pl_id, paquete_num, paquete_num_of, kilos_paquete,
+                 linea, piezas, longitud, marca, line_id),
+            )
+            updated = cur.fetchone() is not None
+        conn.commit()
+        return updated
     finally:
         conn.close()
 

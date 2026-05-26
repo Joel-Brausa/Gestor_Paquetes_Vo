@@ -158,6 +158,27 @@ if "excel_delete_rows_cache" not in st.session_state:
 if "excel_delete_cache_project" not in st.session_state:
     st.session_state.excel_delete_cache_project = None
 
+if "show_delete_line_confirm" not in st.session_state:
+    st.session_state.show_delete_line_confirm = False
+
+if "delete_line_id" not in st.session_state:
+    st.session_state.delete_line_id = None
+
+if "delete_line_label" not in st.session_state:
+    st.session_state.delete_line_label = ""
+
+if "edit_line_last_id" not in st.session_state:
+    st.session_state.edit_line_last_id = None
+
+if "edit_of" not in st.session_state:
+    st.session_state.edit_of = ""
+
+if "edit_n_pedido" not in st.session_state:
+    st.session_state.edit_n_pedido = ""
+
+if "edit_articulo" not in st.session_state:
+    st.session_state.edit_articulo = ""
+
 # ── Sidebar Configuration ──────────────────────────────────────────────────────
 
 with st.sidebar:
@@ -534,32 +555,55 @@ else:
 
 st.markdown("### Añadir nueva línea")
 
+# Pending success message from a previous add (shown after rerun)
+_add_msg = st.session_state.pop("_add_success_msg", None)
+if _add_msg:
+    st.success(_add_msg)
+
 if not st.session_state.selected_project:
     st.info("Selecciona un proyecto primero para añadir líneas.")
 else:
-    col1, col2, col3, col4 = st.columns(4)
-    col5, col6, col7, col8 = st.columns(4)
+    # Compute next paquete num BEFORE the form so it reflects the latest DB state
+    _next_paquete_num = int(database.get_next_paquete_num(
+        database.get_project_id(st.session_state.selected_project)
+    ))
 
-    next_paquete_num = int(database.get_next_paquete_num(database.get_project_id(st.session_state.selected_project)))
+    with st.form("add_line_form", clear_on_submit=True):
+        # Row 0: packing-list level fields
+        col_of, col_npedido, col_articulo = st.columns(3)
+        # Row 1: line-level numeric fields
+        col1, col2, col3, col4 = st.columns(4)
+        # Row 2: remaining line fields + button
+        col5, col6, col7, col8 = st.columns(4)
 
-    with col1:
-        paquete_num = st.number_input("Paquete Num", min_value=1, value=next_paquete_num, key="new_paquete_num")
-    with col2:
-        paquete_num_of = st.number_input("Paquete OF", min_value=0, value=1, key="new_paquete_num_of")
-    with col3:
-        kilos = st.number_input("Kilos", min_value=0.0, value=0.0, step=0.1, key="new_kilos")
-    with col4:
-        linea = st.number_input("Línea", min_value=1, value=1, key="new_linea")
-    with col5:
-        piezas = st.number_input("Piezas", min_value=0, value=1, key="new_piezas")
-    with col6:
-        longitud = st.number_input("Longitud (m)", min_value=0.0, value=0.0, step=0.001, key="new_longitud")
-    with col7:
-        marca = st.text_input("Marca", value="", key="new_marca")
-    with col8:
-        add_btn = st.empty()
+        with col_of:
+            new_of = st.text_input("OF", value="",
+                                   help="Número de OF. Si ya existe se reutiliza su packing list.")
+        with col_npedido:
+            new_n_pedido = st.text_input("N.Pedido", value="",
+                                         help="Solo se aplica si la OF es nueva.")
+        with col_articulo:
+            new_articulo = st.text_input("Artículo", value="",
+                                         help="Solo se aplica si la OF es nueva.")
+        with col1:
+            paquete_num = st.number_input("Paquete Num", min_value=1, value=_next_paquete_num)
+        with col2:
+            paquete_num_of = st.number_input("Paquete OF", min_value=0, value=1)
+        with col3:
+            kilos = st.number_input("Kilos", min_value=0.0, value=0.0, step=0.1)
+        with col4:
+            linea = st.number_input("Línea", min_value=1, value=1)
+        with col5:
+            piezas = st.number_input("Piezas", min_value=0, value=1)
+        with col6:
+            longitud = st.number_input("Longitud (m)", min_value=0.0, value=0.0, step=0.001)
+        with col7:
+            marca = st.text_input("Marca", value="")
+        with col8:
+            st.write("")
+            submitted_add = st.form_submit_button("➕ Añadir")
 
-    if add_btn.button("➕ Añadir", key="add_line_btn"):
+    if submitted_add:
         pid = database.get_project_id(st.session_state.selected_project)
         try:
             database.insert_line(
@@ -571,17 +615,203 @@ else:
                 piezas=int(piezas) if piezas else None,
                 longitud=float(longitud) if longitud else None,
                 marca=marca.strip() if marca.strip() else None,
+                of_number=new_of.strip() if new_of.strip() else None,
+                n_pedido=new_n_pedido.strip() if new_n_pedido.strip() else None,
+                articulo=new_articulo.strip() if new_articulo.strip() else None,
             )
-            st.success(f"✓ Línea añadida (Paquete {paquete_num}, Línea {linea})")
+            st.session_state.logistica_cache_project = None
+            st.session_state._add_success_msg = (
+                f"✓ Línea añadida (Paquete {paquete_num}, Línea {linea})"
+            )
             st.rerun()
         except Exception as e:
             st.error(f"Error al añadir línea: {str(e)}")
 
 st.markdown("---")
 
+# ── Fetch lines with IDs — reused by both Eliminar and Editar subsections ────
+
+_lines_with_ids: list[dict] = []
+if st.session_state.selected_project:
+    _pid_crud = database.get_project_id(st.session_state.selected_project)
+    if _pid_crud:
+        _lines_with_ids = database.get_project_lines_with_ids(_pid_crud)
+
+
+def _line_label(l: dict) -> str:
+    of_display = "Manual" if l["of_number"] == "_MANUAL_ENTRIES" else (l["of_number"] or "-")
+    return (
+        f"[{l['line_id']}] Paq {l['paquete_num']} | OF {of_display} "
+        f"| L{l['linea']} | {l['marca'] or '-'}"
+    )
+
+
+# ── Eliminar línea individual ──────────────────────────────────────────────────
+
+st.markdown("### Eliminar línea")
+
+if not st.session_state.selected_project:
+    st.info("Selecciona un proyecto primero para eliminar líneas.")
+elif not _lines_with_ids:
+    st.info("No hay líneas para eliminar.")
+else:
+    _del_options = {l["line_id"]: _line_label(l) for l in _lines_with_ids}
+
+    col_del1, col_del2 = st.columns([4, 1])
+    with col_del1:
+        _del_selected_id = st.selectbox(
+            "Seleccionar línea a eliminar",
+            options=list(_del_options.keys()),
+            format_func=lambda x: _del_options[x],
+            key="delete_line_select",
+        )
+    with col_del2:
+        st.write("")  # vertical alignment
+        if st.button("🗑️ Eliminar", key="delete_single_line_btn"):
+            st.session_state.delete_line_id = _del_selected_id
+            st.session_state.delete_line_label = _del_options.get(_del_selected_id, "")
+            st.session_state.show_delete_line_confirm = True
+            st.rerun()
+
+if st.session_state.show_delete_line_confirm and st.session_state.delete_line_id is not None:
+    st.warning(
+        f"⚠️ **¿Eliminar permanentemente esta línea?**\n\n"
+        f"`{st.session_state.delete_line_label}`\n\n"
+        "Esta acción no se puede deshacer."
+    )
+    col_yes, col_no = st.columns(2)
+    with col_yes:
+        if st.button("Sí, eliminar", key="confirm_delete_single_line_btn"):
+            try:
+                deleted = database.delete_line_by_id(st.session_state.delete_line_id)
+                st.session_state.show_delete_line_confirm = False
+                st.session_state.delete_line_id = None
+                st.session_state.delete_line_label = ""
+                st.session_state.logistica_cache_project = None
+                if deleted:
+                    st.success("✅ Línea eliminada correctamente.")
+                else:
+                    st.warning("La línea no se encontró (puede que ya hubiera sido eliminada).")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error al eliminar: {str(e)}")
+    with col_no:
+        if st.button("Cancelar", key="cancel_delete_single_line_btn"):
+            st.session_state.show_delete_line_confirm = False
+            st.session_state.delete_line_id = None
+            st.rerun()
+
+st.markdown("---")
+
+# ── Editar línea existente ────────────────────────────────────────────────────
+
+st.markdown("### Editar línea existente")
+
+# Pending success message from a previous update (shown after rerun)
+_edit_msg = st.session_state.pop("_edit_success_msg", None)
+if _edit_msg:
+    st.success(_edit_msg)
+
+if not st.session_state.selected_project:
+    st.info("Selecciona un proyecto primero para editar líneas.")
+elif not _lines_with_ids:
+    st.info("No hay líneas para editar.")
+else:
+    _edit_options = {l["line_id"]: _line_label(l) for l in _lines_with_ids}
+
+    # Selectbox is OUTSIDE the form so changing it immediately reloads the line data
+    _edit_selected_id = st.selectbox(
+        "Seleccionar línea a editar",
+        options=list(_edit_options.keys()),
+        format_func=lambda x: _edit_options[x],
+        key="edit_line_select",
+    )
+
+    # Locate the full dict for the selected line
+    _edit_current = next((l for l in _lines_with_ids if l["line_id"] == _edit_selected_id), None)
+
+    if _edit_current:
+        # When the selected line changes (or after a successful update), reload
+        # session_state from the DB values so the form shows fresh data.
+        if _edit_selected_id != st.session_state.edit_line_last_id:
+            _of_raw = _edit_current["of_number"] or ""
+            st.session_state.edit_of           = "" if _of_raw == "_MANUAL_ENTRIES" else _of_raw
+            st.session_state.edit_n_pedido     = str(_edit_current["n_pedido"] or "")
+            st.session_state.edit_articulo     = str(_edit_current["articulo"] or "")
+            st.session_state.edit_paquete_num    = int(_edit_current["paquete_num"] or 1)
+            st.session_state.edit_paquete_num_of = int(_edit_current["paquete_num_of"] or 0)
+            st.session_state.edit_kilos          = float(_edit_current["kilos_paquete"] or 0.0)
+            st.session_state.edit_linea          = int(_edit_current["linea"] or 1)
+            st.session_state.edit_piezas         = int(_edit_current["piezas"] or 0)
+            st.session_state.edit_longitud       = float(_edit_current["longitud"] or 0.0)
+            st.session_state.edit_marca          = str(_edit_current["marca"] or "")
+            st.session_state.edit_line_last_id   = _edit_selected_id
+
+        # All edit fields inside a form — no rerun on each keystroke
+        with st.form("edit_line_form"):
+            # Row 0: packing-list level fields (editable)
+            col_eof, col_enpedido, col_earticulo = st.columns(3)
+            # Row 1 & 2: line-level fields
+            col_e1, col_e2, col_e3, col_e4 = st.columns(4)
+            col_e5, col_e6, col_e7, col_e8 = st.columns(4)
+
+            with col_eof:
+                e_of = st.text_input("OF", key="edit_of")
+            with col_enpedido:
+                e_n_pedido = st.text_input("N.Pedido", key="edit_n_pedido")
+            with col_earticulo:
+                e_articulo = st.text_input("Artículo", key="edit_articulo")
+            with col_e1:
+                e_paquete_num = st.number_input("Paquete Num", min_value=1, key="edit_paquete_num")
+            with col_e2:
+                e_paquete_num_of = st.number_input("Paquete OF", min_value=0, key="edit_paquete_num_of")
+            with col_e3:
+                e_kilos = st.number_input("Kilos", min_value=0.0, step=0.1, key="edit_kilos")
+            with col_e4:
+                e_linea = st.number_input("Línea", min_value=1, key="edit_linea")
+            with col_e5:
+                e_piezas = st.number_input("Piezas", min_value=0, key="edit_piezas")
+            with col_e6:
+                e_longitud = st.number_input("Longitud (m)", min_value=0.0, step=0.001, key="edit_longitud")
+            with col_e7:
+                e_marca = st.text_input("Marca", key="edit_marca")
+            with col_e8:
+                st.write("")
+            submit_edit = st.form_submit_button("✏️ Actualizar")
+
+        if submit_edit:
+            _pid_edit = database.get_project_id(st.session_state.selected_project)
+            try:
+                updated = database.update_line_full(
+                    project_id=_pid_edit,
+                    line_id=_edit_selected_id,
+                    of_number=e_of.strip() if e_of.strip() else None,
+                    n_pedido=e_n_pedido.strip() if e_n_pedido.strip() else None,
+                    articulo=e_articulo.strip() if e_articulo.strip() else None,
+                    paquete_num=int(e_paquete_num),
+                    paquete_num_of=int(e_paquete_num_of) if e_paquete_num_of else None,
+                    kilos_paquete=float(e_kilos) if e_kilos else None,
+                    linea=int(e_linea) if e_linea else None,
+                    piezas=int(e_piezas) if e_piezas else None,
+                    longitud=float(e_longitud) if e_longitud else None,
+                    marca=e_marca.strip() if e_marca.strip() else None,
+                )
+                st.session_state.logistica_cache_project = None
+                # Force reload of form values from the freshly updated DB row
+                st.session_state.edit_line_last_id = None
+                if updated:
+                    st.session_state._edit_success_msg = "✅ Línea actualizada correctamente."
+                else:
+                    st.session_state._edit_success_msg = "⚠️ La línea no se encontró."
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error al actualizar: {str(e)}")
+
+st.markdown("---")
+
 # ── Delete N.Pedido Subsection ────────────────────────────────────────
 
-st.markdown("### Eliminar líneas de un N.Pedido")
+st.markdown("### Eliminar líneas de una OF completa")
 
 if not st.session_state.selected_project:
     st.info("Selecciona un proyecto primero para eliminar N.Pedidos.")
