@@ -11,6 +11,7 @@ EXPORT_COLUMNS = [
     ("linea", "Línea"),
     ("marca", "Marca"),
     ("piezas", "Piezas"),
+    ("kilos_paquete", "Kilos"),
     ("articulo", "Artículo"),
 ]
 
