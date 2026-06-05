@@ -13,7 +13,10 @@ import exporter
 import excel_base
 from config import load_models, save_models
 
-database.init_db()
+# init_db solo una vez por sesión — evita 4 queries CREATE TABLE en cada rerun
+if not st.session_state.get("db_initialized"):
+    database.init_db()
+    st.session_state.db_initialized = True
 
 st.set_page_config(page_title="Gestor de Paquetes", layout="wide")
 
@@ -73,18 +76,13 @@ _check_password()
 def _project_choices() -> list[str]:
     return [p["name"] for p in database.get_projects()]
 
-def _lines_table(project_name: str):
-    if not project_name:
-        return pd.DataFrame()
-    pid = database.get_project_id(project_name)
-    if pid is None:
-        return pd.DataFrame()
-    rows = database.get_project_lines(pid)
-    if not rows:
+def _lines_table(lines: list) -> pd.DataFrame:
+    """Construye el DataFrame de visualización a partir de las líneas ya cargadas (sin DB)."""
+    if not lines:
         return pd.DataFrame(columns=["OF", "N.Pedido", "Artículo", "Paquete_Num",
                                       "Paquete_Num_OF", "Kilos", "Línea", "Piezas",
                                       "Longitud", "Marca"])
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(lines)
     df = df.rename(columns={
         "of_number": "OF",
         "n_pedido": "N.Pedido",
@@ -178,6 +176,25 @@ if "edit_n_pedido" not in st.session_state:
 
 if "edit_articulo" not in st.session_state:
     st.session_state.edit_articulo = ""
+
+# Caché de project_id, líneas y bytes del Excel — se invalidan cuando cambia el proyecto
+# o cuando se modifican datos, evitando múltiples round-trips a Supabase por rerun.
+if "_pid" not in st.session_state:
+    st.session_state._pid = None
+if "_pid_project" not in st.session_state:
+    st.session_state._pid_project = ""
+if "_lines_cache" not in st.session_state:
+    st.session_state._lines_cache = []
+if "_lines_with_ids_cache" not in st.session_state:
+    st.session_state._lines_with_ids_cache = []
+if "_lines_stale" not in st.session_state:
+    st.session_state._lines_stale = True
+if "_excel_bytes_cache" not in st.session_state:
+    st.session_state._excel_bytes_cache = None
+if "_excel_bytes_project" not in st.session_state:
+    st.session_state._excel_bytes_project = ""
+if "_excel_bytes_stale" not in st.session_state:
+    st.session_state._excel_bytes_stale = True
 
 # ── Sidebar Configuration ──────────────────────────────────────────────────────
 
@@ -401,6 +418,32 @@ if st.session_state.show_delete_confirm:
 
 st.markdown("---")
 
+# ── Caché de proyecto: pid + líneas ───────────────────────────────────────────
+# Se ejecuta una vez por rerun, después de que el selectbox haya actualizado
+# selected_project. Evita 5-8 llamadas repetidas a get_project_id() y
+# 2 llamadas a get_project_lines() por rerun.
+
+_sel = st.session_state.selected_project
+_project_changed = st.session_state._pid_project != _sel
+
+if _project_changed:
+    st.session_state._pid = database.get_project_id(_sel) if _sel else None
+    st.session_state._pid_project = _sel
+    st.session_state._lines_stale = True
+    st.session_state._excel_bytes_stale = True
+    # Invalidar también la caché de logística al cambiar de proyecto
+    st.session_state.logistica_cache_project = None
+
+_pid = st.session_state._pid
+
+if _pid and st.session_state._lines_stale:
+    st.session_state._lines_cache          = database.get_project_lines(_pid)
+    st.session_state._lines_with_ids_cache = database.get_project_lines_with_ids(_pid)
+    st.session_state._lines_stale          = False
+
+_lines           = st.session_state._lines_cache
+_lines_with_ids  = st.session_state._lines_with_ids_cache
+
 # ── Section 2: Import Packing Lists ─────────────────────────────────────────────
 
 st.markdown("## 2. Importar packing list")
@@ -459,12 +502,15 @@ if st.button("🔎 Procesar Documento", key="process_btn"):
                 else:
                     st.success(f"✓ Método utilizado: {method_used}")
 
-                pid = database.get_project_id(st.session_state.selected_project)
-                pl_id = database.save_packing_list(pid, data)
+                pl_id = database.save_packing_list(_pid, data)
                 t3 = time.time()
 
-                lines = database.get_project_lines(pid)
-                of_lines = [l for l in lines if l["of_number"] == data["of_number"]]
+                # Marcar caché de líneas como stale para que se recargue en el próximo rerun
+                st.session_state._lines_stale = True
+                st.session_state.logistica_cache_project = None
+
+                _fresh_lines = database.get_project_lines(_pid)
+                of_lines = [l for l in _fresh_lines if l["of_number"] == data["of_number"]]
                 if of_lines:
                     all_dataframes.append(pd.DataFrame(of_lines))
 
@@ -506,13 +552,8 @@ st.markdown("---")
 
 # ── Section 3: Project Lines ────────────────────────────────────────────────
 
-if st.session_state.selected_project:
-    pid = database.get_project_id(st.session_state.selected_project)
-    lines = database.get_project_lines(pid)
-    max_paquete = max((l["paquete_num"] for l in lines), default=0)
-else:
-    lines = []
-    max_paquete = 0
+lines       = _lines           # alias local, ya cargadas desde la caché
+max_paquete = max((l["paquete_num"] for l in lines), default=0)
 
 st.markdown(f"## 3. Líneas de paquetes del proyecto [{max_paquete} paquetes]")
 
@@ -520,7 +561,8 @@ col1, col2 = st.columns(2)
 
 with col1:
     if st.button("🔄 Refrescar tabla", key="refresh_lines_btn"):
-        st.session_state.logistica_cache_project = None  # forzar regeneración
+        st.session_state.logistica_cache_project = None
+        st.session_state._lines_stale = True
         st.rerun()
 
 # Generar Excel de logística una sola vez por proyecto (cache en session_state)
@@ -547,7 +589,7 @@ with col2:
     elif not lines:
         st.button("🚚 Exportar Logística", key="export_btn_disabled", disabled=True)
 
-lines_df = _lines_table(st.session_state.selected_project)
+lines_df = _lines_table(lines)
 if not lines_df.empty:
     st.dataframe(lines_df, use_container_width=True, hide_index=True)
 else:
@@ -563,10 +605,8 @@ if _add_msg:
 if not st.session_state.selected_project:
     st.info("Selecciona un proyecto primero para añadir líneas.")
 else:
-    # Compute next paquete num BEFORE the form so it reflects the latest DB state
-    _next_paquete_num = int(database.get_next_paquete_num(
-        database.get_project_id(st.session_state.selected_project)
-    ))
+    # Calcular el siguiente paquete_num desde las líneas en caché (sin consulta extra a BD)
+    _next_paquete_num = max((l["paquete_num"] for l in lines), default=0) + 1
 
     with st.form("add_line_form", clear_on_submit=True):
         # Row 0: packing-list level fields
@@ -604,10 +644,9 @@ else:
             submitted_add = st.form_submit_button("➕ Añadir")
 
     if submitted_add:
-        pid = database.get_project_id(st.session_state.selected_project)
         try:
             database.insert_line(
-                project_id=pid,
+                project_id=_pid,
                 paquete_num=int(paquete_num),
                 paquete_num_of=int(paquete_num_of) if paquete_num_of else None,
                 kilos_paquete=float(kilos) if kilos else None,
@@ -620,6 +659,7 @@ else:
                 articulo=new_articulo.strip() if new_articulo.strip() else None,
             )
             st.session_state.logistica_cache_project = None
+            st.session_state._lines_stale = True
             st.session_state._add_success_msg = (
                 f"✓ Línea añadida (Paquete {paquete_num}, Línea {linea})"
             )
@@ -629,13 +669,7 @@ else:
 
 st.markdown("---")
 
-# ── Fetch lines with IDs — reused by both Eliminar and Editar subsections ────
-
-_lines_with_ids: list[dict] = []
-if st.session_state.selected_project:
-    _pid_crud = database.get_project_id(st.session_state.selected_project)
-    if _pid_crud:
-        _lines_with_ids = database.get_project_lines_with_ids(_pid_crud)
+# _lines_with_ids ya está cargado desde la caché (ver bloque "Caché de proyecto" arriba)
 
 
 def _line_label(l: dict) -> str:
@@ -688,6 +722,7 @@ if st.session_state.show_delete_line_confirm and st.session_state.delete_line_id
                 st.session_state.delete_line_id = None
                 st.session_state.delete_line_label = ""
                 st.session_state.logistica_cache_project = None
+                st.session_state._lines_stale = True
                 if deleted:
                     st.success("✅ Línea eliminada correctamente.")
                 else:
@@ -780,10 +815,9 @@ else:
             submit_edit = st.form_submit_button("✏️ Actualizar")
 
         if submit_edit:
-            _pid_edit = database.get_project_id(st.session_state.selected_project)
             try:
                 updated = database.update_line_full(
-                    project_id=_pid_edit,
+                    project_id=_pid,
                     line_id=_edit_selected_id,
                     of_number=e_of.strip() if e_of.strip() else None,
                     n_pedido=e_n_pedido.strip() if e_n_pedido.strip() else None,
@@ -797,6 +831,7 @@ else:
                     marca=e_marca.strip() if e_marca.strip() else None,
                 )
                 st.session_state.logistica_cache_project = None
+                st.session_state._lines_stale = True
                 # Force reload of form values from the freshly updated DB row
                 st.session_state.edit_line_last_id = None
                 if updated:
@@ -819,8 +854,7 @@ else:
     col1, col2 = st.columns([2, 1])
 
     try:
-        pid = database.get_project_id(st.session_state.selected_project)
-        n_pedidos = database.get_unique_n_pedidos(pid) if pid else []
+        n_pedidos = database.get_unique_n_pedidos(_pid) if _pid else []
     except Exception as e:
         st.error(f"Error al cargar N.Pedidos: {str(e)}")
         n_pedidos = []
@@ -844,10 +878,9 @@ else:
 
 if st.session_state.show_delete_n_pedido_confirm and st.session_state.delete_n_pedido_value:
     n_pedido = st.session_state.delete_n_pedido_value
-    pid = database.get_project_id(st.session_state.selected_project)
 
     try:
-        count_db = database.count_n_pedido_lines(pid, n_pedido)
+        count_db = database.count_n_pedido_lines(_pid, n_pedido)
         count_excel = excel_base.count_n_pedido_rows_in_excel(
             st.session_state.selected_project, n_pedido
         )
@@ -866,7 +899,7 @@ if st.session_state.show_delete_n_pedido_confirm and st.session_state.delete_n_p
         with col1:
             if st.button("Sí, eliminar", key="confirm_delete_n_pedido_btn"):
                 try:
-                    deleted_db = database.delete_n_pedido_lines(pid, n_pedido)
+                    deleted_db = database.delete_n_pedido_lines(_pid, n_pedido)
                     deleted_excel = 0
                     if excel_base.excel_exists(st.session_state.selected_project):
                         try:
@@ -876,6 +909,9 @@ if st.session_state.show_delete_n_pedido_confirm and st.session_state.delete_n_p
                         except Exception as excel_error:
                             st.warning(f"⚠️ Eliminado de BD pero error en Excel: {str(excel_error)}")
                     st.session_state.show_delete_n_pedido_confirm = False
+                    st.session_state._lines_stale = True
+                    st.session_state.logistica_cache_project = None
+                    st.session_state._excel_bytes_stale = True
                     st.success(
                         f"N.Pedido {n_pedido} eliminado: "
                         f"{deleted_db} líneas de BD, {deleted_excel} filas de Excel"
@@ -901,9 +937,17 @@ st.markdown("## 4. Excel base del proyecto")
 if not st.session_state.selected_project:
     st.info("Selecciona un proyecto primero para gestionar su Excel base.")
 else:
-    pid = database.get_project_id(st.session_state.selected_project)
+    # ── Caché de bytes del Excel (evita descargar el binario en cada rerun) ──────
+    if (
+        st.session_state._excel_bytes_project != st.session_state.selected_project
+        or st.session_state._excel_bytes_stale
+    ):
+        st.session_state._excel_bytes_cache   = database.load_project_excel(_pid) if _pid else None
+        st.session_state._excel_bytes_project = st.session_state.selected_project
+        st.session_state._excel_bytes_stale   = False
 
-    has_excel = excel_base.excel_exists(st.session_state.selected_project)
+    _excel_bytes = st.session_state._excel_bytes_cache
+    has_excel    = _excel_bytes is not None
 
     # ── Excel Status + Delete Button ──────────────────────────────────────────
     if has_excel:
@@ -924,11 +968,13 @@ else:
         with col_yes:
             if st.button("Sí, eliminar", key="confirm_excel_delete_btn"):
                 try:
-                    excel_base.delete_project_excel(st.session_state.selected_project)
+                    with st.spinner("Eliminando Excel..."):
+                        excel_base.delete_project_excel(st.session_state.selected_project)
                     st.session_state.show_excel_delete_confirm = False
                     st.session_state.excel_preview_update_needed = True
                     st.session_state.excel_upload_key += 1
                     st.session_state.excel_delete_rows_cache = None
+                    st.session_state._excel_bytes_stale = True
                     st.success("Excel base eliminado.")
                     st.rerun()
                 except Exception as e:
@@ -950,15 +996,17 @@ else:
         )
         if uploaded_excel:
             try:
-                database.save_project_excel(
-                    pid,
-                    uploaded_excel.getvalue(),
-                    uploaded_excel.name,
-                )
+                with st.spinner("Guardando Excel..."):
+                    database.save_project_excel(
+                        _pid,
+                        uploaded_excel.getvalue(),
+                        uploaded_excel.name,
+                    )
                 st.success(f"✅ Excel base guardado: {uploaded_excel.name}")
                 st.session_state.excel_preview_update_needed = True
                 st.session_state.excel_upload_key += 1
                 st.session_state.excel_delete_rows_cache = None
+                st.session_state._excel_bytes_stale = True
                 st.rerun()
             except Exception as e:
                 st.error(f"❌ Error al guardar Excel: {str(e)}")
@@ -975,14 +1023,17 @@ else:
         with col2:
             if st.button("🔄 Sincronizar", key="excel_sync_btn"):
                 try:
-                    project_lines = database.get_project_lines(pid)
-                    if not project_lines:
-                        st.warning("El proyecto no tiene líneas para exportar.")
-                    else:
-                        result = excel_base.write_lines_to_excel(
-                            st.session_state.selected_project,
-                            project_lines,
-                        )
+                    with st.spinner("Sincronizando líneas con el Excel..."):
+                        # Carga fresca para garantizar datos actualizados en la sincronización
+                        project_lines = database.get_project_lines(_pid)
+                        if not project_lines:
+                            st.warning("El proyecto no tiene líneas para exportar.")
+                        else:
+                            result = excel_base.write_lines_to_excel(
+                                st.session_state.selected_project,
+                                project_lines,
+                            )
+                    if project_lines:
                         message = f"✅ {result['added']} filas añadidas"
                         if result["duplicates"] > 0:
                             message += f", {result['duplicates']} duplicados ignorados"
@@ -991,23 +1042,20 @@ else:
                             st.warning(f"⚠️ {error}")
                         st.session_state.excel_preview_update_needed = True
                         st.session_state.excel_delete_rows_cache = None
+                        st.session_state._excel_bytes_stale = True
                         st.rerun()
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
 
         with col3:
-            try:
-                excel_bytes = database.load_project_excel(pid)
-                if excel_bytes:
-                    st.download_button(
-                        label="⬇️ Descargar",
-                        data=excel_bytes,
-                        file_name=f"{st.session_state.selected_project}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="excel_download_file_btn",
-                    )
-            except Exception as e:
-                st.error(f"❌ Error: {str(e)}")
+            if _excel_bytes:
+                st.download_button(
+                    label="⬇️ Descargar",
+                    data=_excel_bytes,
+                    file_name=f"{st.session_state.selected_project}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="excel_download_file_btn",
+                )
 
     # ── Delete Rows Expander ───────────────────────────────────────────────────
     if has_excel:
@@ -1018,7 +1066,10 @@ else:
             or st.session_state.excel_delete_cache_project != st.session_state.selected_project
         ):
             try:
-                preview_data = excel_base.read_excel_preview(st.session_state.selected_project)
+                # Pasamos los bytes ya cacheados para evitar otra descarga de BD
+                preview_data = excel_base.read_excel_preview(
+                    st.session_state.selected_project, excel_bytes=_excel_bytes
+                )
                 st.session_state.excel_delete_rows_cache = [
                     r for r in preview_data if r["row"] >= 14
                 ]
@@ -1099,6 +1150,7 @@ else:
                         st.session_state.show_excel_rows_delete_confirm = False
                         st.session_state.excel_preview_update_needed = True
                         st.session_state.excel_delete_rows_cache = None
+                        st.session_state._excel_bytes_stale = True
                         st.success(
                             f"✅ {deleted} fila{'s' if deleted != 1 else ''} eliminada"
                             f"{'s' if deleted != 1 else ''} del Excel base."
@@ -1128,6 +1180,7 @@ else:
                         st.session_state.show_excel_delete_all_confirm = False
                         st.session_state.excel_preview_update_needed = True
                         st.session_state.excel_delete_rows_cache = None
+                        st.session_state._excel_bytes_stale = True
                         st.success(f"✅ {deleted} filas eliminadas del Excel base.")
                         st.rerun()
                     except Exception as e:

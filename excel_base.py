@@ -181,8 +181,10 @@ def delete_project_excel(project_name: str) -> bool:
     return database.delete_project_excel_from_db(pid)
 
 
-def read_excel_preview(project_name: str) -> list[dict]:
-    excel_bytes = _load_excel_bytes(project_name)
+def read_excel_preview(project_name: str, excel_bytes: Optional[bytes] = None) -> list[dict]:
+    """Lee el Excel para vista previa. Si se pasan excel_bytes no se consulta la BD."""
+    if excel_bytes is None:
+        excel_bytes = _load_excel_bytes(project_name)
     if not excel_bytes:
         return []
     try:

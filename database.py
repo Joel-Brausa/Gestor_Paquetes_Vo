@@ -1,8 +1,12 @@
 import os
-import psycopg2
-import psycopg2.extras
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
+
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
 
 
 def _get_database_url() -> str:
@@ -24,13 +28,51 @@ def _get_database_url() -> str:
     )
 
 
-def _connect() -> psycopg2.extensions.connection:
-    return psycopg2.connect(_get_database_url())
+# ── Connection pool ───────────────────────────────────────────────────────────
+#
+# Un pool de conexiones compartido para toda la vida del proceso.
+# Evita abrir una nueva conexión TCP+TLS por cada consulta (~150-300 ms cada una).
+# ThreadedConnectionPool es seguro para uso concurrente desde múltiples sesiones.
+
+_pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    global _pool
+    if _pool is None or getattr(_pool, "closed", False):
+        with _pool_lock:
+            if _pool is None or getattr(_pool, "closed", False):
+                _pool = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=1,
+                    maxconn=3,
+                    dsn=_get_database_url(),
+                )
+    return _pool
+
+
+@contextmanager
+def _get_conn():
+    """
+    Context manager que toma una conexión del pool y la devuelve al salir.
+    En caso de excepción hace rollback automático antes de devolver la conexión.
+    """
+    pool = _get_pool()
+    conn = pool.getconn()
+    try:
+        yield conn
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        pool.putconn(conn)
 
 
 def init_db() -> None:
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS projects (
@@ -78,15 +120,12 @@ def init_db() -> None:
                 )
             """)
         conn.commit()
-    finally:
-        conn.close()
 
 
 # ── Projects ──────────────────────────────────────────────────────────────────
 
 def create_project(name: str) -> int:
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO projects (name, created_at) VALUES (%s, %s) RETURNING id",
@@ -95,34 +134,25 @@ def create_project(name: str) -> int:
             row = cur.fetchone()
         conn.commit()
         return row[0]
-    finally:
-        conn.close()
 
 
 def get_projects() -> list[dict]:
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT id, name FROM projects ORDER BY name")
             return [dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
 
 
 def get_project_id(name: str) -> Optional[int]:
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM projects WHERE name = %s", (name,))
             row = cur.fetchone()
             return row[0] if row else None
-    finally:
-        conn.close()
 
 
 def delete_project(project_id: int) -> None:
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM lines WHERE packing_list_id IN "
@@ -132,8 +162,6 @@ def delete_project(project_id: int) -> None:
             cur.execute("DELETE FROM packing_lists WHERE project_id = %s", (project_id,))
             cur.execute("DELETE FROM projects WHERE id = %s", (project_id,))
         conn.commit()
-    finally:
-        conn.close()
 
 
 # ── Packing Lists ─────────────────────────────────────────────────────────────
@@ -142,8 +170,7 @@ def save_packing_list(project_id: int, data: dict) -> tuple[int, bool]:
     now = datetime.now(timezone.utc).isoformat()
     of_number = data["of_number"]
 
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id FROM packing_lists WHERE project_id = %s AND of_number = %s",
@@ -208,28 +235,10 @@ def save_packing_list(project_id: int, data: dict) -> tuple[int, bool]:
                 )
         conn.commit()
         return pl_id
-    finally:
-        conn.close()
-
-
-def get_next_paquete_num(project_id: int) -> int:
-    conn = _connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT MAX(paquete_num) FROM lines WHERE packing_list_id IN "
-                "(SELECT id FROM packing_lists WHERE project_id = %s)",
-                (project_id,),
-            )
-            row = cur.fetchone()
-            return (row[0] or 0) + 1
-    finally:
-        conn.close()
 
 
 def get_project_lines(project_id: int) -> list[dict]:
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """SELECT
@@ -247,15 +256,12 @@ def get_project_lines(project_id: int) -> list[dict]:
                 (project_id,),
             )
             return [dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
 
 
 # ── N.Pedido Management ───────────────────────────────────────────────────────
 
 def delete_n_pedido_lines(project_id: int, n_pedido: str) -> int:
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*) FROM lines WHERE packing_list_id IN "
@@ -274,13 +280,10 @@ def delete_n_pedido_lines(project_id: int, n_pedido: str) -> int:
             )
         conn.commit()
         return count
-    finally:
-        conn.close()
 
 
 def get_unique_n_pedidos(project_id: int) -> list[str]:
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT DISTINCT n_pedido FROM packing_lists "
@@ -288,13 +291,10 @@ def get_unique_n_pedidos(project_id: int) -> list[str]:
                 (project_id,),
             )
             return [row[0] for row in cur.fetchall()]
-    finally:
-        conn.close()
 
 
 def count_n_pedido_lines(project_id: int, n_pedido: str) -> int:
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT COUNT(*) FROM lines WHERE packing_list_id IN "
@@ -302,14 +302,11 @@ def count_n_pedido_lines(project_id: int, n_pedido: str) -> int:
                 (project_id, n_pedido),
             )
             return cur.fetchone()[0]
-    finally:
-        conn.close()
 
 
 def get_paquete_nums_for_n_pedido(project_id: int, n_pedido: str) -> list[dict]:
     """Return paquete_num, marca, piezas for all lines of a given n_pedido."""
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """SELECT l.paquete_num, l.marca, l.piezas
@@ -319,13 +316,10 @@ def get_paquete_nums_for_n_pedido(project_id: int, n_pedido: str) -> list[dict]:
                 (project_id, n_pedido),
             )
             return [dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
 
 
 def get_n_pedido_for_paquete(project_id: int, paquete_num: int) -> Optional[str]:
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """SELECT DISTINCT pl.n_pedido FROM packing_lists pl
@@ -336,8 +330,6 @@ def get_n_pedido_for_paquete(project_id: int, paquete_num: int) -> Optional[str]
             )
             row = cur.fetchone()
             return row[0] if row else None
-    finally:
-        conn.close()
 
 
 # ── Manual Line Insertion ─────────────────────────────────────────────────────
@@ -363,8 +355,7 @@ def insert_line(
     When of_number is empty or None, a shared '_MANUAL_ENTRIES' packing_list is used.
     """
     of_key = (of_number.strip() if of_number and of_number.strip() else None) or "_MANUAL_ENTRIES"
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT id FROM packing_lists WHERE project_id = %s AND of_number = %s",
@@ -401,14 +392,11 @@ def insert_line(
             line_id = cur.fetchone()[0]
         conn.commit()
         return line_id
-    finally:
-        conn.close()
 
 
 def get_project_lines_with_ids(project_id: int) -> list[dict]:
     """Like get_project_lines but also returns the primary key of each line as 'line_id'."""
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """SELECT
@@ -427,21 +415,16 @@ def get_project_lines_with_ids(project_id: int) -> list[dict]:
                 (project_id,),
             )
             return [dict(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
 
 
 def delete_line_by_id(line_id: int) -> bool:
     """Delete a single line by its primary key. Returns True if a row was deleted."""
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM lines WHERE id = %s RETURNING id", (line_id,))
             deleted = cur.fetchone() is not None
         conn.commit()
         return deleted
-    finally:
-        conn.close()
 
 
 def update_line(
@@ -455,8 +438,7 @@ def update_line(
     marca: str | None,
 ) -> bool:
     """Update the fields of a single line. Returns True if a row was updated."""
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """UPDATE lines SET
@@ -475,8 +457,6 @@ def update_line(
             updated = cur.fetchone() is not None
         conn.commit()
         return updated
-    finally:
-        conn.close()
 
 
 def update_line_full(
@@ -506,8 +486,7 @@ def update_line_full(
     np_val = n_pedido.strip() if n_pedido and n_pedido.strip() else None
     art_val = articulo.strip() if articulo and articulo.strip() else None
 
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             # Find or create the target packing_list
             cur.execute(
@@ -554,8 +533,6 @@ def update_line_full(
             updated = cur.fetchone() is not None
         conn.commit()
         return updated
-    finally:
-        conn.close()
 
 
 # ── Excel File Storage ────────────────────────────────────────────────────────
@@ -563,8 +540,7 @@ def update_line_full(
 def save_project_excel(project_id: int, excel_data: bytes, filename: str = "") -> None:
     """Store or replace the Excel base file for a project in the database."""
     now = datetime.now(timezone.utc).isoformat()
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO project_excel_files (project_id, excel_data, filename, updated_at)
@@ -576,14 +552,11 @@ def save_project_excel(project_id: int, excel_data: bytes, filename: str = "") -
                 (project_id, psycopg2.Binary(excel_data), filename, now),
             )
         conn.commit()
-    finally:
-        conn.close()
 
 
 def load_project_excel(project_id: int) -> Optional[bytes]:
     """Load the Excel base file for a project. Returns None if not found."""
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT excel_data FROM project_excel_files WHERE project_id = %s",
@@ -591,26 +564,20 @@ def load_project_excel(project_id: int) -> Optional[bytes]:
             )
             row = cur.fetchone()
             return bytes(row[0]) if row else None
-    finally:
-        conn.close()
 
 
 def excel_exists_in_db(project_id: int) -> bool:
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM project_excel_files WHERE project_id = %s",
                 (project_id,),
             )
             return cur.fetchone() is not None
-    finally:
-        conn.close()
 
 
 def delete_project_excel_from_db(project_id: int) -> bool:
-    conn = _connect()
-    try:
+    with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM project_excel_files WHERE project_id = %s RETURNING id",
@@ -619,5 +586,3 @@ def delete_project_excel_from_db(project_id: int) -> bool:
             deleted = cur.fetchone() is not None
         conn.commit()
         return deleted
-    finally:
-        conn.close()
