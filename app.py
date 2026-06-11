@@ -97,7 +97,12 @@ def _lines_table(lines: list) -> pd.DataFrame:
     })
     cols = ["OF", "N.Pedido", "Artículo", "Paquete_Num", "Paquete_Num_OF",
             "Kilos", "Línea", "Piezas", "Longitud", "Marca"]
-    return df[[c for c in cols if c in df.columns]]
+    df = df[[c for c in cols if c in df.columns]]
+    # Orden incremental por paquete y luego por línea (no por OF)
+    sort_cols = [c for c in ["Paquete_Num", "Línea"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(by=sort_cols, kind="stable", na_position="last").reset_index(drop=True)
+    return df
 
 # ── Initialize session state ──────────────────────────────────────────────────
 
@@ -134,6 +139,11 @@ if "logistica_cache_project" not in st.session_state:
 
 if "pdf_upload_key" not in st.session_state:
     st.session_state.pdf_upload_key = 0
+
+# Mensajes del último procesado de PDFs — persisten tras el rerun hasta que el
+# usuario los quita. Lista de tuplas (nivel, texto): nivel ∈ {success, warning, error}.
+if "processing_messages" not in st.session_state:
+    st.session_state.processing_messages = []
 
 if "excel_upload_key" not in st.session_state:
     st.session_state.excel_upload_key = 0
@@ -465,8 +475,10 @@ if st.button("🔎 Procesar Documento", key="process_btn"):
         st.error("❌ OpenRouter API Key no encontrada para el paso 2.")
     else:
         progress_container = st.container()
-        messages_list = []
-        all_dataframes = []
+        # Mensajes persistentes (nivel, texto) que sobreviven al rerun final
+        persistent_msgs: list[tuple[str, str]] = []
+        # Avisos de fallback capturados del callback de estado (motivo del salto a Nemotron)
+        captured_warnings: list[str] = []
         total = len(uploaded_files)
 
         with progress_container:
@@ -482,6 +494,9 @@ if st.button("🔎 Procesar Documento", key="process_btn"):
 
                 def _on_status(msg: str, _i=i, _total=total, _name=filename):
                     status_text.text(f"[{_i}/{_total}] {_name} — {msg}")
+                    # Capturar los avisos de fallback (⚠️) para mostrarlos de forma persistente
+                    if "⚠️" in msg:
+                        captured_warnings.append(f"{_name}: {msg}")
 
                 t1 = time.time()
                 data = extractor.extract_data(
@@ -498,9 +513,13 @@ if st.button("🔎 Procesar Documento", key="process_btn"):
 
                 method_used = data.get("extraction_method", "unknown")
                 if "fallback" in method_used:
-                    st.warning(f"⚠️ Método utilizado: {method_used}")
+                    persistent_msgs.append(
+                        ("warning", f"⚠️ {filename}: método utilizado = {method_used}")
+                    )
                 else:
-                    st.success(f"✓ Método utilizado: {method_used}")
+                    persistent_msgs.append(
+                        ("success", f"✓ {filename}: método utilizado = {method_used}")
+                    )
 
                 pl_id = database.save_packing_list(_pid, data)
                 t3 = time.time()
@@ -511,42 +530,51 @@ if st.button("🔎 Procesar Documento", key="process_btn"):
 
                 _fresh_lines = database.get_project_lines(_pid)
                 of_lines = [l for l in _fresh_lines if l["of_number"] == data["of_number"]]
-                if of_lines:
-                    all_dataframes.append(pd.DataFrame(of_lines))
 
                 tiempo_api = f"{t2-t1:.1f}s"
                 tiempo_bd = f"{t3-t2:.2f}s"
-                msg = (f"✓ {filename}: {data['of_number']} importado "
-                       f"({len(of_lines)} líneas) [API:{tiempo_api} BD:{tiempo_bd}]")
-                messages_list.append(msg)
+                persistent_msgs.append((
+                    "success",
+                    f"✓ {filename}: {data['of_number']} importado "
+                    f"({len(of_lines)} líneas) [API:{tiempo_api} BD:{tiempo_bd}]",
+                ))
 
             except ValueError as e:
                 # OF duplicado — aviso específico, no error genérico
-                messages_list.append(f"⚠️ {filename}: {str(e)}")
+                persistent_msgs.append(("warning", f"⚠️ {filename}: {str(e)}"))
             except Exception as e:
-                messages_list.append(f"✗ {filename}: {str(e)}")
+                persistent_msgs.append(("error", f"✗ {filename}: {str(e)}"))
 
             progress_bar.progress(i / total)
 
         status_text.empty()
         progress_bar.empty()
 
-        for msg in messages_list:
-            if msg.startswith("✓"):
-                st.success(msg)
-            elif msg.startswith("⚠️"):
-                st.warning(msg)
-            else:
-                st.error(msg)
+        # Añadir el motivo del fallback (por qué pdfPlumber cayó a Nemotron), si lo hubo
+        for w in captured_warnings:
+            persistent_msgs.append(("warning", f"⚠️ {w}"))
 
-        if all_dataframes:
-            combined_df = pd.concat(all_dataframes, ignore_index=True)
-            st.markdown("### Líneas extraídas")
-            st.dataframe(combined_df, use_container_width=True)
-
-        # Limpiar el file uploader
+        # Guardar para mostrarlos de forma persistente tras el rerun
+        st.session_state.processing_messages = persistent_msgs
         st.session_state.pdf_upload_key += 1
         st.rerun()
+
+# ── Mensajes del último procesado (persisten hasta que el usuario los quita) ──
+if st.session_state.processing_messages:
+    hdr_col, btn_col = st.columns([5, 1])
+    with hdr_col:
+        st.markdown("**Resultado del último procesado**")
+    with btn_col:
+        if st.button("✖ Quitar", key="clear_processing_msgs_btn"):
+            st.session_state.processing_messages = []
+            st.rerun()
+    for _level, _text in st.session_state.processing_messages:
+        if _level == "success":
+            st.success(_text)
+        elif _level == "warning":
+            st.warning(_text)
+        else:
+            st.error(_text)
 
 st.markdown("---")
 
@@ -1001,6 +1029,7 @@ else:
                         _pid,
                         uploaded_excel.getvalue(),
                         uploaded_excel.name,
+                        set_template=True,   # guarda la copia pristine para regenerar en cada sync
                     )
                 st.success(f"✅ Excel base guardado: {uploaded_excel.name}")
                 st.session_state.excel_preview_update_needed = True

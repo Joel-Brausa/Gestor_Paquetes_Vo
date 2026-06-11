@@ -111,14 +111,20 @@ def init_db() -> None:
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS project_excel_files (
-                    id          SERIAL PRIMARY KEY,
-                    project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-                    excel_data  BYTEA NOT NULL,
-                    filename    TEXT,
-                    updated_at  TEXT NOT NULL,
+                    id            SERIAL PRIMARY KEY,
+                    project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    excel_data    BYTEA NOT NULL,
+                    template_data BYTEA,
+                    filename      TEXT,
+                    updated_at    TEXT NOT NULL,
                     UNIQUE(project_id)
                 )
             """)
+            # Migración para proyectos existentes: añadir la columna template_data
+            # (copia pristine del Excel subido, nunca sobrescrita por la sincronización).
+            cur.execute(
+                "ALTER TABLE project_excel_files ADD COLUMN IF NOT EXISTS template_data BYTEA"
+            )
         conn.commit()
 
 
@@ -537,25 +543,55 @@ def update_line_full(
 
 # ── Excel File Storage ────────────────────────────────────────────────────────
 
-def save_project_excel(project_id: int, excel_data: bytes, filename: str = "") -> None:
-    """Store or replace the Excel base file for a project in the database."""
+def save_project_excel(
+    project_id: int,
+    excel_data: bytes,
+    filename: str = "",
+    set_template: bool = False,
+) -> None:
+    """
+    Guarda o reemplaza el Excel de trabajo de un proyecto.
+
+    - set_template=True  (subida del usuario): guarda los bytes como copia de trabajo
+      Y como plantilla pristine (template_data). La plantilla es la fuente intacta
+      desde la que se regenera el Excel en cada sincronización.
+    - set_template=False (salida de sync / borrado de filas): actualiza solo la copia
+      de trabajo (excel_data); NUNCA toca template_data, y conserva el filename
+      existente si se pasa vacío.
+    """
     now = datetime.now(timezone.utc).isoformat()
     with _get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO project_excel_files (project_id, excel_data, filename, updated_at)
-                   VALUES (%s, %s, %s, %s)
-                   ON CONFLICT (project_id) DO UPDATE
-                   SET excel_data = EXCLUDED.excel_data,
-                       filename   = EXCLUDED.filename,
-                       updated_at = EXCLUDED.updated_at""",
-                (project_id, psycopg2.Binary(excel_data), filename, now),
-            )
+            if set_template:
+                cur.execute(
+                    """INSERT INTO project_excel_files
+                           (project_id, excel_data, template_data, filename, updated_at)
+                       VALUES (%s, %s, %s, %s, %s)
+                       ON CONFLICT (project_id) DO UPDATE
+                       SET excel_data    = EXCLUDED.excel_data,
+                           template_data = EXCLUDED.template_data,
+                           filename      = EXCLUDED.filename,
+                           updated_at    = EXCLUDED.updated_at""",
+                    (project_id, psycopg2.Binary(excel_data),
+                     psycopg2.Binary(excel_data), filename, now),
+                )
+            else:
+                cur.execute(
+                    """INSERT INTO project_excel_files
+                           (project_id, excel_data, filename, updated_at)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (project_id) DO UPDATE
+                       SET excel_data = EXCLUDED.excel_data,
+                           filename   = COALESCE(NULLIF(EXCLUDED.filename, ''),
+                                                 project_excel_files.filename),
+                           updated_at = EXCLUDED.updated_at""",
+                    (project_id, psycopg2.Binary(excel_data), filename, now),
+                )
         conn.commit()
 
 
 def load_project_excel(project_id: int) -> Optional[bytes]:
-    """Load the Excel base file for a project. Returns None if not found."""
+    """Load the working Excel file for a project. Returns None if not found."""
     with _get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -564,6 +600,26 @@ def load_project_excel(project_id: int) -> Optional[bytes]:
             )
             row = cur.fetchone()
             return bytes(row[0]) if row else None
+
+
+def load_project_excel_template(project_id: int) -> Optional[bytes]:
+    """
+    Carga la plantilla pristine del Excel (template_data).
+    Si un proyecto antiguo no tiene plantilla guardada (NULL), recurre a la copia
+    de trabajo (excel_data) como mejor aproximación disponible.
+    """
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT template_data, excel_data FROM project_excel_files WHERE project_id = %s",
+                (project_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            template, working = row
+            data = template if template is not None else working
+            return bytes(data) if data is not None else None
 
 
 def excel_exists_in_db(project_id: int) -> bool:

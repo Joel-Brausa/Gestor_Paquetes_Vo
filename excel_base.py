@@ -1,8 +1,10 @@
 import re
 from io import BytesIO
 from typing import Optional
+from copy import copy
 
 from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border
 
 import database
 
@@ -101,23 +103,44 @@ def _extract_marca_for_h(marca_raw) -> str:
     return s
 
 
-def _get_existing_lines(ws, layout: dict) -> set:
+def _get_existing_paquete_counts(ws, layout: dict) -> dict:
     """
-    Devuelve un set de tuplas (paquete_code, marca, piezas) de las filas de datos (14+).
-    Lee solo los valores escritos por nosotros, nunca fórmulas.
+    Devuelve un dict {paquete_code: n_filas} contando cuántas filas
+    existen en el Excel por cada paquete_code (filas 14+).
+
+    Esto permite una deduplicación posicional robusta:
+    - No depende del valor de marca (inestable por el lookup AM/AN)
+    - Funciona correctamente cuando múltiples líneas del mismo paquete
+      tienen igual marca y piezas (que antes causaba omisiones)
+    - Garantiza idempotencia: N syncs consecutivos siempre producen el
+      mismo resultado que el primero
     """
-    existing = set()
+    counts: dict = {}
     for row_num in range(_DATA_START_ROW, ws.max_row + 1):
         col_p = ws.cell(row=row_num, column=layout["col_paquete"]).value
-        if col_p:
-            col_m = ws.cell(row=row_num, column=layout["col_marca"]).value
-            col_z = ws.cell(row=row_num, column=layout["col_piezas"]).value
-            existing.add((
-                str(col_p),
-                str(col_m) if col_m is not None else "",
-                str(col_z) if col_z is not None else "",
-            ))
-    return existing
+        if col_p is not None:
+            key = str(col_p)
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _copy_cell_style(source_cell, target_cell) -> None:
+    """
+    Copia los estilos de una celda a otra.
+    Preserva: font, fill, alignment, border, number_format, etc.
+    """
+    if source_cell.font:
+        target_cell.font = copy(source_cell.font)
+    if source_cell.border:
+        target_cell.border = copy(source_cell.border)
+    if source_cell.fill:
+        target_cell.fill = copy(source_cell.fill)
+    if source_cell.number_format:
+        target_cell.number_format = copy(source_cell.number_format)
+    if source_cell.protection:
+        target_cell.protection = copy(source_cell.protection)
+    if source_cell.alignment:
+        target_cell.alignment = copy(source_cell.alignment)
 
 
 def _clear_data_cols(ws, row_num: int, layout: dict) -> None:
@@ -236,8 +259,21 @@ def find_marca_in_column_am(project_name: str, marca: str) -> str:
 
 def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
     """
-    Escribe las líneas del proyecto en el Excel a partir de la fila 14.
-    Cada línea de la BD → una fila del Excel.
+    Regenera el Excel de trabajo desde la PLANTILLA PRISTINE y escribe TODAS las
+    líneas actuales de la BD a partir de la fila 14. Cada línea DB → una fila Excel.
+
+    Por qué desde la plantilla pristine y no desde la copia de trabajo:
+      openpyxl no es un editor que preserve el formato — al guardar, reconstruye el
+      .xlsx desde su modelo interno y descarta lo que no modela (printerSettings,
+      customXml, relaciones de hoja, valores cacheados de fórmulas, etc.). Si en cada
+      sync recargáramos la salida anterior de openpyxl, el deterioro se acumularía y el
+      formato (incl. los desplegables de validación) se degradaría. Cargando siempre la
+      plantilla original (autoría de Excel), cada sync tiene la misma calidad que el
+      primero y nunca se compone el daño. Además, leer la plantilla intacta da valores
+      cacheados correctos para el lookup de marca AM/AN.
+
+    El Excel resultante es un reflejo puro de las líneas en BD (las ediciones hechas a
+    mano directamente en las filas de datos del Excel no se conservan entre syncs).
 
     Columnas escritas por fila (según layout auto-detectado):
       v1:  A — paquete_code  |  B — "Bundle"  |  H — marca (AM lookup)  |  I — piezas
@@ -245,44 +281,38 @@ def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
 
     La columna de fórmula (G en v1, H en v2) nunca se toca.
 
-    Clave de duplicados: (paquete_code, marca, piezas) — estable entre sincronizaciones.
-
-    Guarda el Excel actualizado en la BD.
+    Guarda solo la copia de trabajo (no la plantilla).
     Devuelve dict: {added, duplicates, errors}.
     """
     pid = database.get_project_id(project_name)
     if pid is None:
         raise ValueError("Proyecto no encontrado.")
-    excel_bytes = database.load_project_excel(pid)
-    if not excel_bytes:
+    template_bytes = database.load_project_excel_template(pid)
+    if not template_bytes:
         raise ValueError("Sube un Excel base primero")
 
-    # Detectar layout con el workbook de escritura (preserva fórmulas)
-    wb = load_workbook(BytesIO(excel_bytes))
+    # Cargar SIEMPRE desde la plantilla pristine (preserva fórmulas y formato)
+    wb = load_workbook(BytesIO(template_bytes))
     ws = wb.active
     layout = _detect_layout(ws)
 
-    # Caché del lookup AM/AN (usa data_only=True para leer valores cacheados)
-    am_values = _build_am_cache(excel_bytes, layout)
+    # Caché del lookup AM/AN desde la plantilla (valores cacheados intactos)
+    am_values = _build_am_cache(template_bytes, layout)
 
-    # Leer prefijo desde B5 (igual en v1 y v2)
+    # Leer prefijo desde B5 (igual en v1 y v2); si está vacío, fijarlo
     b5_value = ws.cell(row=_PREFIX_CELL[0], column=_PREFIX_CELL[1]).value
     col_a_prefix = str(b5_value).strip() if b5_value else project_name
+    if not b5_value:
+        ws.cell(row=_PREFIX_CELL[0], column=_PREFIX_CELL[1]).value = col_a_prefix
 
-    existing_lines = _get_existing_lines(ws, layout)
+    # Reflejo puro de la BD: limpiar cualquier fila de datos preexistente en la plantilla
+    for row_num in range(_DATA_START_ROW, ws.max_row + 1):
+        if ws.cell(row=row_num, column=layout["col_paquete"]).value is not None:
+            _clear_data_cols(ws, row_num, layout)
 
     added = 0
-    duplicates = 0
     errors = []
-
-    # Primera fila vacía en la columna de paquete, a partir de la fila 14
     current_row = _DATA_START_ROW
-    for row_num in range(_DATA_START_ROW, ws.max_row + 1):
-        if ws.cell(row=row_num, column=layout["col_paquete"]).value is None:
-            current_row = row_num
-            break
-    else:
-        current_row = ws.max_row + 1
 
     for line in lines:
         try:
@@ -293,14 +323,8 @@ def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
             )
             paquete_code = f"{col_a_prefix}/{paquete_num_str}"
 
-            marca_h   = _lookup_marca_in_am(line.get("marca", ""), am_values)
-            piezas    = line.get("piezas", "")
-            piezas_str = str(piezas) if piezas else ""
-
-            line_tuple = (paquete_code, marca_h, piezas_str)
-            if line_tuple in existing_lines:
-                duplicates += 1
-                continue
+            marca_h = _lookup_marca_in_am(line.get("marca", ""), am_values)
+            piezas  = line.get("piezas", "")
 
             ws.cell(row=current_row, column=layout["col_paquete"]).value = paquete_code
             ws.cell(row=current_row, column=layout["col_bundle"]).value  = "Bundle"
@@ -309,7 +333,6 @@ def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
 
             added += 1
             current_row += 1
-            existing_lines.add(line_tuple)
 
         except Exception as e:
             errors.append(f"Fila {current_row}: {str(e)}")
@@ -317,9 +340,10 @@ def write_lines_to_excel(project_name: str, lines: list[dict]) -> dict:
     buf = BytesIO()
     wb.save(buf)
     wb.close()
+    # Solo la copia de trabajo; la plantilla pristine permanece intacta
     database.save_project_excel(pid, buf.getvalue())
 
-    return {"added": added, "duplicates": duplicates, "errors": errors}
+    return {"added": added, "duplicates": 0, "errors": errors}
 
 
 def count_n_pedido_rows_in_excel(project_name: str, n_pedido: str) -> int:
