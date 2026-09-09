@@ -46,10 +46,12 @@ Rules:
 
 
 def pdf_to_base64_images(pdf_bytes: bytes, dpi: int = 150) -> list[str]:
-    from pdf2image import convert_from_bytes
-    images = convert_from_bytes(pdf_bytes, dpi=dpi, fmt="PNG")
+    import pypdfium2 as pdfium
+    pdf = pdfium.PdfDocument(pdf_bytes)
     result = []
-    for img in images:
+    scale = dpi / 72.0
+    for page in pdf:
+        img = page.render(scale=scale).to_pil()
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         result.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
@@ -63,15 +65,19 @@ def _pdf_to_base64_images_for_parse(pdf_bytes: bytes) -> list[str]:
     within the API's ~1 MB per-image limit.
     Auto-reduces quality further if the image is still too large.
     """
-    from pdf2image import convert_from_bytes
+    import pypdfium2 as pdfium
 
     DPI = 120
     MAX_BYTES = 900_000   # ~900 KB safety margin below the 1 MB limit
     QUALITY_START = 85
 
-    images = convert_from_bytes(pdf_bytes, dpi=DPI, fmt="PNG")
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    scale = DPI / 72.0
     result = []
-    for img in images:
+    for page in pdf:
+        img = page.render(scale=scale).to_pil()
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
         quality = QUALITY_START
         while True:
             buf = io.BytesIO()

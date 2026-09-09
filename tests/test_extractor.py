@@ -1,5 +1,9 @@
 import pytest
-from extractor import parse_llm_response
+from extractor import (
+    parse_llm_response,
+    pdf_to_base64_images,
+    _pdf_to_base64_images_for_parse,
+)
 
 
 def test_parse_clean_json():
@@ -52,3 +56,30 @@ def test_parse_full_structure():
     result = parse_llm_response(raw)
     assert result["paquetes"][0]["lineas"][0]["marca"] == "11889"
     assert result["kilos_teoricos"] == 2284.0
+
+
+def _create_sample_pdf_bytes() -> bytes:
+    import io
+    import pypdfium2 as pdfium
+    doc = pdfium.PdfDocument.new()
+    doc.new_page(200, 200)
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def test_pdf_to_base64_images():
+    pdf_bytes = _create_sample_pdf_bytes()
+    images = pdf_to_base64_images(pdf_bytes)
+    assert len(images) == 1
+    assert isinstance(images[0], str)
+    assert len(images[0]) > 0
+
+
+def test_pdf_to_base64_images_for_parse():
+    pdf_bytes = _create_sample_pdf_bytes()
+    images = _pdf_to_base64_images_for_parse(pdf_bytes)
+    assert len(images) == 1
+    assert isinstance(images[0], str)
+    assert len(images[0]) > 0
+
